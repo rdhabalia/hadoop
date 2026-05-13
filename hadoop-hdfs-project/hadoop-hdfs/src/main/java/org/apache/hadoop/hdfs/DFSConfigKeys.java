@@ -758,6 +758,44 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
       "dfs.datanode.max.slowdisks.to.exclude";
   public static final int DFS_DATANODE_MAX_SLOWDISKS_TO_EXCLUDE_DEFAULT =
       0;
+
+  // -- DataNode affinity manager configuration keys --------------------------
+  // Pluggable regex-based DataNode affinity, used to pin block placement for
+  // file paths matching a regex to a fixed pool of DataNodes (tenant isolation).
+  public static final String DFS_DATANODE_AFFINITY_MANAGER_CLASSNAME_KEY =
+      "dfs.datanode.affinity.manager.classname";
+  // MySQL implementation: affinity table name
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_TABLE =
+      "dfs.datanode.affinity.mysql.table";
+  // File implementation: absolute path to the JSON affinity file
+  public static final String DFS_DATANODE_AFFINITY_FILE_PATH_KEY =
+      "dfs.datanode.affinity.file.path";
+  // MySQL connection settings used by MysqlDatanodeAffinityManager.
+  // Kept under the affinity namespace so this feature is self-contained in
+  // upstream Hadoop — LinkedIn's fork shares these with MysqlHostFileManager
+  // under dfs.hosts.mysql.*, but that manager is not upstream.
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_URL =
+      "dfs.datanode.affinity.mysql.url";
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_USERNAME =
+      "dfs.datanode.affinity.mysql.username";
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_DRIVER =
+      "dfs.datanode.affinity.mysql.driver";
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_DRIVER_DEFAULT =
+      "com.mysql.cj.jdbc.Driver";
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_QUERY_TIMEOUT_MS =
+      "dfs.datanode.affinity.mysql.query.timeout.ms";
+  public static final int DFS_DATANODE_AFFINITY_MYSQL_QUERY_TIMEOUT_MS_DEFAULT =
+      60000;
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_NETWORK_TIMEOUT_MS =
+      "dfs.datanode.affinity.mysql.network.timeout.ms";
+  public static final int DFS_DATANODE_AFFINITY_MYSQL_NETWORK_TIMEOUT_MS_DEFAULT =
+      30000;
+  // Prefix for HikariCP-specific tunables (e.g. maximumPoolSize, idleTimeout).
+  // Any property with this prefix is forwarded to HikariConfig with the
+  // prefix stripped.
+  public static final String DFS_DATANODE_AFFINITY_MYSQL_HIKARI_PREFIX =
+      "dfs.datanode.affinity.mysql.hikari.";
+
   public static final String  DFS_DATANODE_HOST_NAME_KEY =
       HdfsClientConfigKeys.DeprecatedKeys.DFS_DATANODE_HOST_NAME_KEY;
   public static final String  DFS_NAMENODE_CHECKPOINT_DIR_KEY =

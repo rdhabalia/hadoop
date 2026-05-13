@@ -51,6 +51,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import javax.management.ObjectName;
 
@@ -466,6 +467,33 @@ public class BlockManager implements BlockStatsMXBean {
   private volatile BlockPlacementPolicies placementPolicies;
   private final BlockStoragePolicySuite storagePolicySuite;
 
+  /** Saved reference to the configuration so per-affinity-group BPPs can be
+   * rebuilt after {@link DatanodeAffinityManager#refresh()}. */
+  private Configuration conf;
+
+  /**
+   * Pairs a file-path {@link Pattern} with the {@link BlockPlacementPolicies}
+   * that use a restricted {@link org.apache.hadoop.net.NetworkTopology}
+   * containing only the DataNodes eligible for that affinity group.
+   */
+  static final class AffinityPlacementGroup {
+    final Pattern pathPattern;
+    final BlockPlacementPolicies policies;
+
+    AffinityPlacementGroup(Pattern pathPattern,
+        BlockPlacementPolicies policies) {
+      this.pathPattern = pathPattern;
+      this.policies = policies;
+    }
+  }
+
+  /**
+   * Immutable snapshot of per-group placement policies. Replaced atomically
+   * by {@link #buildAffinityBasedBlockPlacementPolicies()}.
+   */
+  private volatile List<AffinityPlacementGroup> affinityPlacementGroups =
+      Collections.emptyList();
+
   /** Check whether name system is running before terminating */
   private boolean checkNSRunning = true;
 
@@ -506,6 +534,7 @@ public class BlockManager implements BlockStatsMXBean {
   public BlockManager(final Namesystem namesystem, boolean haEnabled,
       final Configuration conf) throws IOException {
     this.namesystem = namesystem;
+    this.conf = conf;
     this.datanodeManager = new DatanodeManager(this, namesystem, conf);
     this.heartbeatManager = datanodeManager.getHeartbeatManager();
     this.blockIdManager = new BlockIdManager(this);
@@ -535,6 +564,9 @@ public class BlockManager implements BlockStatsMXBean {
         conf, datanodeManager.getFSClusterStats(),
         datanodeManager.getNetworkTopology(),
         datanodeManager.getHost2DatanodeMap());
+    // DatanodeManager has already called the affinity manager's first
+    // refresh() inside its constructor, so per-group topologies are ready.
+    buildAffinityBasedBlockPlacementPolicies();
     this.storagePolicySuite = BlockStoragePolicySuite.createDefaultSuite(conf);
     this.pendingReconstruction = new PendingReconstructionBlocks(conf.getInt(
         DFSConfigKeys.DFS_NAMENODE_RECONSTRUCTION_PENDING_TIMEOUT_SEC_KEY,
@@ -862,6 +894,74 @@ public class BlockManager implements BlockStatsMXBean {
             datanodeManager.getNetworkTopology(),
             datanodeManager.getHost2DatanodeMap());
     placementPolicies = bpp;
+    this.conf = conf;
+    buildAffinityBasedBlockPlacementPolicies();
+  }
+
+  /**
+   * Build per-affinity-group {@link BlockPlacementPolicies}, each backed by
+   * the restricted {@link org.apache.hadoop.net.NetworkTopology} from
+   * {@link DatanodeAffinityManager#getAffinityGroupTopologies()}.
+   *
+   * <p>Called:
+   * <ul>
+   *   <li>At {@link BlockManager} construction (after DatanodeManager init).</li>
+   *   <li>After {@link DatanodeAffinityManager#refresh()} completes (via
+   *       {@link DatanodeManager#postAffinityRefresh(Set)}).</li>
+   *   <li>After {@link #refreshBlockPlacementPolicy(Configuration)}.</li>
+   * </ul>
+   *
+   * <p>Failure logs and leaves the previous policy in effect — block
+   * placement always has a working policy.
+   */
+  void buildAffinityBasedBlockPlacementPolicies() {
+    try {
+      if (datanodeManager == null
+          || datanodeManager.getDatanodeAffinityManager() == null) {
+        return;
+      }
+      final DatanodeAffinityManager affinityManager =
+          datanodeManager.getDatanodeAffinityManager();
+      final List<DatanodeAffinityManager.AffinityGroupTopology> topologies =
+          affinityManager.getAffinityGroupTopologies();
+      if (topologies.isEmpty()) {
+        affinityPlacementGroups = Collections.emptyList();
+        return;
+      }
+      final List<AffinityPlacementGroup> groups =
+          new ArrayList<>(topologies.size());
+      for (DatanodeAffinityManager.AffinityGroupTopology entry : topologies) {
+        final BlockPlacementPolicies groupPolicies = new BlockPlacementPolicies(
+            conf,
+            datanodeManager.getFSClusterStats(),
+            entry.topology,
+            datanodeManager.getHost2DatanodeMap());
+        groups.add(new AffinityPlacementGroup(entry.pathPattern, groupPolicies));
+      }
+      affinityPlacementGroups = Collections.unmodifiableList(groups);
+      LOG.info("BlockManager: rebuilt {} affinity placement group(s)",
+          groups.size());
+    } catch (Exception e) {
+      LOG.warn("Failed to rebuild affinity placement policies; "
+          + "default placement remains in effect", e);
+    }
+  }
+
+  /**
+   * Return the first {@link AffinityPlacementGroup} whose path pattern
+   * matches {@code src}, or {@code null} if none match.
+   */
+  private AffinityPlacementGroup findAffinityGroup(String src) {
+    final List<AffinityPlacementGroup> groups = affinityPlacementGroups;
+    if (src == null || groups == null || groups.isEmpty()) {
+      return null;
+    }
+    for (AffinityPlacementGroup group : groups) {
+      if (group.pathPattern.matcher(src).find()) {
+        return group;
+      }
+    }
+    return null;
   }
 
   /** Dump meta data to out. */
@@ -2475,14 +2575,43 @@ public class BlockManager implements BlockStatsMXBean {
       final BlockType blockType,
       final ErasureCodingPolicy ecPolicy,
       final EnumSet<AddBlockFlag> flags) throws IOException {
-    List<DatanodeDescriptor> favoredDatanodeDescriptors = 
-        getDatanodeDescriptors(favoredNodes);
     final BlockStoragePolicy storagePolicy =
         storagePolicySuite.getPolicy(storagePolicyID);
+
+    DatanodeStorageInfo[] targets;
+
+    // Step 1: Try the per-affinity-group policy (restricted topology).
+    // The group's NetworkTopology contains only eligible DataNodes, so
+    // NetworkTopology.chooseRandom() never needs a large exclusion list.
+    final AffinityPlacementGroup affinityGroup = findAffinityGroup(src);
+    if (affinityGroup != null) {
+      final List<DatanodeDescriptor> favored =
+          getDatanodeDescriptors(favoredNodes);
+      final BlockPlacementPolicy affinityPolicy =
+          affinityGroup.policies.getPolicy(blockType);
+      targets = affinityPolicy.chooseTarget(src, numOfReplicas, client,
+          excludedNodes, blocksize, favored, storagePolicy, flags);
+      final boolean sufficient = (blockType == BlockType.STRIPED)
+          ? targets.length >= ecPolicy.getNumDataUnits()
+          : targets.length >= minReplication;
+      if (sufficient) {
+        return targets;
+      }
+      LOG.debug("DatanodeAffinity: affinity pool for '{}' returned only {} "
+          + "target(s); falling back to default placement policy",
+          src, targets.length);
+    }
+
+    // Step 2: Default placement policy.
+    // Affinity DataNodes are absent from the default NetworkTopology (they
+    // were removed by DatanodeManager when they registered into an affinity
+    // group), so the default BlockPlacementPolicy will not select them.
+    final List<DatanodeDescriptor> favoredDatanodeDescriptors =
+        getDatanodeDescriptors(favoredNodes);
     final BlockPlacementPolicy blockplacement =
         placementPolicies.getPolicy(blockType);
-    final DatanodeStorageInfo[] targets = blockplacement.chooseTarget(src,
-        numOfReplicas, client, excludedNodes, blocksize, 
+    targets = blockplacement.chooseTarget(src,
+        numOfReplicas, client, excludedNodes, blocksize,
         favoredDatanodeDescriptors, storagePolicy, flags);
 
     final String errorMessage = "File %s could only be written to %d of " +

@@ -188,6 +188,21 @@ https://maven.apache.org/xsd/maven-4.0.0.xsd">
       <artifactId>netty-all</artifactId>
       <scope>compile</scope>
     </dependency>
+    <!-- HikariCP: connection pool used by MysqlDatanodeAffinityManager.
+         Only loaded when dfs.datanode.affinity.manager.classname points to
+         MysqlDatanodeAffinityManager — disabled by default. -->
+    <dependency>
+      <groupId>com.zaxxer</groupId>
+      <artifactId>HikariCP</artifactId>
+      <scope>compile</scope>
+    </dependency>
+    <!-- Apache Derby: in-memory MySQL-compatible driver used by
+         TestDatanodeAffinityManager to avoid requiring a real MySQL. -->
+    <dependency>
+      <groupId>org.apache.derby</groupId>
+      <artifactId>derby</artifactId>
+      <scope>test</scope>
+    </dependency>
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-kms</artifactId>

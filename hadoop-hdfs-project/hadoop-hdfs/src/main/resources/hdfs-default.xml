@@ -4285,6 +4285,101 @@
 </property>
 
 <property>
+  <name>dfs.datanode.affinity.manager.classname</name>
+  <value></value>
+  <description>
+    Fully-qualified class name of the DatanodeAffinityManager implementation.
+    Enables regex-based DataNode tenant isolation: each affinity group maps
+    a source-path regex to a DataNode hostname regex; matched DataNodes are
+    isolated into a per-group NetworkTopology so block placement for the
+    matching paths is strictly confined to that pool, while non-matching
+    paths cannot land on it. If empty or absent, no affinity manager is
+    used and BlockPlacementPolicy falls back to default placement with
+    zero overhead. Built-in implementations:
+      org.apache.hadoop.hdfs.server.blockmanagement.MysqlDatanodeAffinityManager
+      org.apache.hadoop.hdfs.server.blockmanagement.FileDatanodeAffinityManager
+    Affinity groups can be refreshed at runtime via "dfsadmin -refreshNodes".
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.table</name>
+  <value></value>
+  <description>
+    Name of the MySQL table used by MysqlDatanodeAffinityManager. The table
+    is created automatically on first startup if it does not exist. Schema:
+      affinity_group_name VARCHAR(255)  NOT NULL,
+      file_regex          VARCHAR(1024) NOT NULL  -- matched against srcPath
+      datanode_regex      VARCHAR(2048) NOT NULL  -- matched against hostname:port
+      PRIMARY KEY (affinity_group_name, file_regex)
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.url</name>
+  <value></value>
+  <description>
+    JDBC URL for the MySQL database used by MysqlDatanodeAffinityManager
+    (e.g. jdbc:mysql://host:3306/dbname). Required when affinity.manager.classname
+    points to MysqlDatanodeAffinityManager.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.username</name>
+  <value></value>
+  <description>
+    MySQL username for MysqlDatanodeAffinityManager. Deployments using
+    certificate-based auth can leave this empty and configure the driver
+    via dfs.datanode.affinity.mysql.hikari.* properties.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.driver</name>
+  <value>com.mysql.cj.jdbc.Driver</value>
+  <description>
+    JDBC driver class for MysqlDatanodeAffinityManager. Override for
+    alternative drivers (e.g. org.apache.derby.jdbc.EmbeddedDriver in tests).
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.query.timeout.ms</name>
+  <value>60000</value>
+  <description>
+    Per-statement query timeout (ms). Applied to every SELECT / CREATE TABLE
+    executed by MysqlDatanodeAffinityManager.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.mysql.network.timeout.ms</name>
+  <value>30000</value>
+  <description>
+    JDBC connection.setNetworkTimeout (ms). Prevents a wedged MySQL server
+    from blocking NameNode threads indefinitely.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.affinity.file.path</name>
+  <value></value>
+  <description>
+    Absolute path to the JSON file used by FileDatanodeAffinityManager.
+    Expected format:
+      [
+        {
+          "affinityGroupName": "hcl-group",
+          "regexPattern":      "^/data/hcl/.*",
+          "datanodeRegex":     "^[a-z]+-hcl[0-9]+\\.example\\.com:.*"
+        }
+      ]
+    The file is reloaded on every "dfsadmin -refreshNodes" call.
+  </description>
+</property>
+
+<property>
   <name>dfs.namenode.hosts.provider.classname</name>
   <value>org.apache.hadoop.hdfs.server.blockmanagement.HostFileManager</value>
   <description>
