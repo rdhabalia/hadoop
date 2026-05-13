@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdfs.server.datanode.fsdataset.impl;
 
 import java.io.BufferedWriter;
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -35,10 +36,13 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -148,6 +152,64 @@ public class FsVolumeImpl implements FsVolumeSpi {
    */
   protected ThreadPoolExecutor cacheExecutor;
 
+  /** Per-volume resources for the BufferedBlockWriter path. Null when the
+   * write-buffer feature is disabled. */
+  private BufferWriteResource bufferResources;
+  /** Per-block write-buffer size; only meaningful when buffering is enabled. */
+  private int maxWriteBufferCapacityBytes;
+
+  /**
+   * Per-volume resources used by {@link
+   * org.apache.hadoop.hdfs.server.datanode.BufferedBlockWriter} implementations:
+   * a flush concurrency semaphore, a serial executor for page-cache drop
+   * operations, and a lock used to serialize O_DIRECT writes on a single
+   * volume.
+   */
+  public static class BufferWriteResource implements Closeable {
+    /** Monitor used by the O_DIRECT writer to serialize tail writes on a
+     * single volume — keeps the DSYNC fallback channel and the O_DIRECT fd
+     * from racing each other. */
+    private final Object volumeAccessLock = new Object();
+    /** Per-volume flush permit. Null disables the bound. */
+    private final Semaphore flushPermitSemaphore;
+    /** Serial executor used for best-effort POSIX_FADV_DONTNEED scheduling.
+     * Bounded queue protects against runaway memory growth if the page-cache
+     * drop scheduler falls behind. */
+    private volatile ExecutorService volumeExecutor;
+
+    public BufferWriteResource(Semaphore flushPermitSemaphore) {
+      this.flushPermitSemaphore = flushPermitSemaphore;
+      this.volumeExecutor = new ThreadPoolExecutor(1, 1,
+          Long.MAX_VALUE, TimeUnit.NANOSECONDS,
+          new LinkedBlockingQueue<>(64000),
+          new ThreadFactoryBuilder()
+              .setDaemon(true)
+              .setNameFormat("FsVolumeBufferExec-%d")
+              .build());
+    }
+
+    public Object getVolumeAccessLock() {
+      return volumeAccessLock;
+    }
+
+    public Optional<Semaphore> getFlushPermitSemaphore() {
+      return Optional.ofNullable(flushPermitSemaphore);
+    }
+
+    public ExecutorService getVolumeExecutor() {
+      return volumeExecutor;
+    }
+
+    @Override
+    public void close() {
+      ExecutorService exec = volumeExecutor;
+      if (exec != null) {
+        exec.shutdown();
+        volumeExecutor = null;
+      }
+    }
+  }
+
   FsVolumeImpl(FsDatasetImpl dataset, String storageID, StorageDirectory sd,
       FileIoProvider fileIoProvider, Configuration conf) throws IOException {
     // outside tests, usage created in ReservedSpaceCalculator.Builder
@@ -204,6 +266,39 @@ public class FsVolumeImpl implements FsVolumeSpi {
     } else {
       mount = "";
     }
+    initBufferWriteResource(conf);
+  }
+
+  /**
+   * Configure the per-volume write-buffer resources. No-op when the feature
+   * is disabled. Skipped for transient (RAM_DISK) volumes since buffered
+   * writes do not apply there.
+   */
+  private void initBufferWriteResource(Configuration conf) {
+    boolean writeMemoryBufferEnabled = conf.getBoolean(
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED_DEFAULT);
+    if (!writeMemoryBufferEnabled || storageType.isTransient()) {
+      return;
+    }
+    this.maxWriteBufferCapacityBytes = conf.getInt(
+        DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES,
+        DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES_DEFAULT);
+    if (maxWriteBufferCapacityBytes <= 0) {
+      LOG.warn("Ignoring invalid {}={}; write buffer disabled on {}",
+          DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES,
+          maxWriteBufferCapacityBytes, baseURI);
+      return;
+    }
+    int concurrentFlushWritesMB = conf.getInt(
+        DFSConfigKeys.DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME,
+        DFSConfigKeys.DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME_DEFAULT);
+    int bufferSizeMB = Math.max(1, maxWriteBufferCapacityBytes / (1024 * 1024));
+    int concurrentFlushWrites = concurrentFlushWritesMB / bufferSizeMB;
+    Semaphore flushPermitSemaphore = concurrentFlushWrites > 0
+        ? new Semaphore(concurrentFlushWrites, true /* fair, for ordering */)
+        : null;
+    bufferResources = new BufferWriteResource(flushPermitSemaphore);
   }
 
   String getMount() {
@@ -1113,6 +1208,20 @@ public class FsVolumeImpl implements FsVolumeSpi {
     if (metrics != null) {
       metrics.unRegister();
     }
+    if (bufferResources != null) {
+      bufferResources.close();
+      bufferResources = null;
+    }
+  }
+
+  /** @return per-volume write-buffer resources, or null if disabled. */
+  public BufferWriteResource getBufferResources() {
+    return bufferResources;
+  }
+
+  /** @return configured per-block write-buffer size in bytes. */
+  public int getMaxWriteBufferCapacityBytes() {
+    return maxWriteBufferCapacityBytes;
   }
 
   void addBlockPool(String bpid, Configuration c) throws IOException {

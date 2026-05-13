@@ -145,6 +145,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -494,6 +495,12 @@ public class DataNode extends ReconfigurableBase
   private DataTransferThrottler ecReconstuctReadThrottler;
   private DataTransferThrottler ecReconstuctWriteThrottler;
 
+  // BufferedBlockWriter wiring — see DataNode Vertical Efficiency design.
+  // {@code writeMemoryBufferEnabled} is the global on/off; the semaphore caps
+  // the number of in-flight in-memory write buffers across the JVM.
+  private boolean writeMemoryBufferEnabled;
+  private Semaphore maxConcurrentWriteBuffers;
+
   /**
    * Creates a dummy DataNode for testing purpose.
    */
@@ -611,6 +618,7 @@ public class DataNode extends ReconfigurableBase
             });
 
     initOOBTimeout();
+    initMemoryBufferConfig(conf);
     this.storageLocationChecker = storageLocationChecker;
     long ecReconstuctReadBandwidth = conf.getLongBytes(
         DFSConfigKeys.DFS_DATANODE_EC_RECONSTRUCT_READ_BANDWIDTHPERSEC_KEY,
@@ -4391,5 +4399,62 @@ public class DataNode extends ReconfigurableBase
   @VisibleForTesting
   public BlockPoolManager getBlockPoolManager() {
     return blockPoolManager;
+  }
+
+  /**
+   * Initialize the write-memory-buffer feature. When enabled, a global
+   * semaphore caps the number of in-flight buffers across the JVM so that
+   * total off-heap usage stays bounded by
+   * {@code dfs.datanode.write.memory.buffer.max.capacity.mb}.
+   *
+   * If the configured capacity is non-positive, default to 10% of the JVM
+   * max heap. The semaphore size is the capacity divided by the per-block
+   * buffer size — at least 1.
+   */
+  private void initMemoryBufferConfig(Configuration conf) {
+    this.writeMemoryBufferEnabled = conf.getBoolean(
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED_DEFAULT);
+    if (!writeMemoryBufferEnabled) {
+      return;
+    }
+    int writeMemoryBufferMaxCapacityMB = conf.getInt(
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB,
+        DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB_DEFAULT);
+    int maxWriteBufferCapacity = conf.getInt(
+        DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES,
+        DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES_DEFAULT);
+    if (maxWriteBufferCapacity <= 0) {
+      LOG.warn("Invalid {}={}; disabling write buffer.",
+          DFSConfigKeys.DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES,
+          maxWriteBufferCapacity);
+      this.writeMemoryBufferEnabled = false;
+      return;
+    }
+    if (writeMemoryBufferMaxCapacityMB <= 0) {
+      writeMemoryBufferMaxCapacityMB =
+          (int) ((Runtime.getRuntime().maxMemory() / (1024 * 1024)) * 0.10);
+    }
+    long writeMemoryBufferMaxCapacityBytes =
+        writeMemoryBufferMaxCapacityMB * 1024L * 1024L;
+    int maxConcurrentWrites = Math.max(1,
+        (int) (writeMemoryBufferMaxCapacityBytes / maxWriteBufferCapacity));
+    this.maxConcurrentWriteBuffers = new Semaphore(maxConcurrentWrites);
+    LOG.info(
+        "Configured pooled write buffer: max-concurrent-buffers={}, "
+            + "max-capacity-mb={}, useODirect={}",
+        maxConcurrentWrites, writeMemoryBufferMaxCapacityMB,
+        dnConf.useOdirectBuffer);
+  }
+
+  /** @return whether the DataNode-wide write-memory-buffer is enabled. */
+  public boolean isWriteMemoryBufferEnabled() {
+    return writeMemoryBufferEnabled;
+  }
+
+  /** @return the global concurrency semaphore for write buffers, or null
+   * if the feature is disabled. */
+  public Semaphore getMaxConcurrentWriteBuffers() {
+    return maxConcurrentWriteBuffers;
   }
 }

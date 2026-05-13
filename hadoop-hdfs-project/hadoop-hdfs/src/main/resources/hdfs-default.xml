@@ -1777,6 +1777,68 @@
 </property>
 
 <property>
+  <name>dfs.datanode.read.ahead.cache.bytes.threshold</name>
+  <value>262144</value>
+  <description>
+    Read size threshold (bytes) above which BlockSender considers the read
+    "long" and applies the configured readahead / drop-cache-behind-reads
+    heuristics. Defaults to 256KB.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.write.memory.buffer.enabled</name>
+  <value>false</value>
+  <description>
+    Enable the DataNode write-buffer optimization: small packet writes are
+    accumulated in an off-heap memory buffer per block and flushed to disk
+    in larger segments via a DSYNC FileChannel. Reduces small random write
+    IOPs and frees the page cache for reads. See the "DataNode Vertical
+    Efficiency" design for details.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.write.memory.buffer.max.capacity.mb</name>
+  <value>-1</value>
+  <description>
+    Total in-flight write-buffer capacity at the DataNode in MB. A negative
+    or zero value defaults to 10% of the JVM max heap. The effective
+    concurrency limit is this value divided by
+    dfs.datanode.write.buffer.size.bytes.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.write.buffer.size.bytes</name>
+  <value>8388608</value>
+  <description>
+    Per-block write-buffer size in bytes. Each in-flight RBW replica
+    consumes one buffer of this size from the global capacity. Default 8MB.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.write.o.direct.enabled</name>
+  <value>false</value>
+  <description>
+    Experimental: use O_DIRECT for the buffered write path instead of a
+    DSYNC FileChannel. Requires JNA and Linux. Defaults to false.
+  </description>
+</property>
+
+<property>
+  <name>dfs.datanode.concurrent.flush.mb.per.volume</name>
+  <value>0</value>
+  <description>
+    Per-volume flush-concurrency budget (MB). Controls how many buffered
+    flushes may be in-flight simultaneously on a single volume. Zero
+    disables the per-volume cap. Used together with
+    dfs.datanode.write.memory.buffer.enabled.
+  </description>
+</property>
+
+<property>
   <name>dfs.datanode.drop.cache.behind.writes</name>
   <value>false</value>
   <description>

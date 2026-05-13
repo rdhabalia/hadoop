@@ -152,6 +152,9 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final boolean DFS_DATANODE_SYNC_BEHIND_WRITES_IN_BACKGROUND_DEFAULT = false;
   public static final String  DFS_DATANODE_DROP_CACHE_BEHIND_READS_KEY = "dfs.datanode.drop.cache.behind.reads";
   public static final boolean DFS_DATANODE_DROP_CACHE_BEHIND_READS_DEFAULT = false;
+  public static final String  DFS_DATANODE_READ_AHEAD_CACHE_BYTES_THRESHOLD_KEY =
+      "dfs.datanode.read.ahead.cache.bytes.threshold";
+  public static final long DFS_DATANODE_READ_AHEAD_CACHE_BYTES_THRESHOLD_DEFAULT = 256 * 1024;
   public static final String  DFS_DATANODE_USE_DN_HOSTNAME = "dfs.datanode.use.datanode.hostname";
   public static final boolean DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT = false;
   public static final String  DFS_DATANODE_MAX_LOCKED_MEMORY_KEY = "dfs.datanode.max.locked.memory";
@@ -1607,6 +1610,37 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
   public static final String DFS_DATANODE_SLOW_IO_WARNING_THRESHOLD_KEY =
       "dfs.datanode.slow.io.warning.threshold.ms";
   public static final long DFS_DATANODE_SLOW_IO_WARNING_THRESHOLD_DEFAULT = 300;
+
+  // DataNode write-buffer optimization (see DataNode Vertical Efficiency design).
+  // When enabled, packet writes are accumulated in a per-block memory buffer and
+  // flushed to disk in large segments to reduce small random write IOPs and free
+  // up disk bandwidth for reads.
+  public static final String DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED =
+      "dfs.datanode.write.memory.buffer.enabled";
+  public static final boolean DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED_DEFAULT =
+      false;
+  // Total max write-buffer capacity at the DataNode (MB).
+  // If <= 0, defaults to 10% of the JVM max heap.
+  public static final String DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB =
+      "dfs.datanode.write.memory.buffer.max.capacity.mb";
+  public static final int DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB_DEFAULT =
+      -1;
+  // Toggle the O_DIRECT-based buffered writer (experimental).
+  public static final String DFS_DATANODE_WRITE_O_DIRECT_ENABLED =
+      "dfs.datanode.write.o.direct.enabled";
+  public static final boolean DFS_DATANODE_WRITE_O_DIRECT_ENABLED_DEFAULT =
+      false;
+  // Per-volume flush concurrency budget (MB).
+  // 0 disables the per-volume flush semaphore.
+  public static final String DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME =
+      "dfs.datanode.concurrent.flush.mb.per.volume";
+  public static final int DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME_DEFAULT =
+      0;
+  // Per-block in-memory write buffer size (bytes).
+  public static final String DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES =
+      "dfs.datanode.write.buffer.size.bytes";
+  public static final int DFS_DATANODE_WRITE_BUFFER_SIZE_BYTES_DEFAULT =
+      8 * 1024 * 1024;
 
   // Number of parallel threads to load multiple datanode volumes
   public static final String DFS_DATANODE_PARALLEL_VOLUME_LOAD_THREADS_NUM_KEY =

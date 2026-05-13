@@ -188,6 +188,13 @@ https://maven.apache.org/xsd/maven-4.0.0.xsd">
       <artifactId>netty-all</artifactId>
       <scope>compile</scope>
     </dependency>
+    <!-- JNA is used by DirectIOBufferedBlockWriter (O_DIRECT path) and is
+         disabled by default via dfs.datanode.write.o.direct.enabled=false. -->
+    <dependency>
+      <groupId>net.java.dev.jna</groupId>
+      <artifactId>jna</artifactId>
+      <scope>compile</scope>
+    </dependency>
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-kms</artifactId>

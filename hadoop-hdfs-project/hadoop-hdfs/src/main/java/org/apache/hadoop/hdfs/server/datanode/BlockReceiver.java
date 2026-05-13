@@ -24,6 +24,7 @@ import java.io.Closeable;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.EOFException;
+import java.io.File;
 import java.io.IOException;
 import java.io.InterruptedIOException;
 import java.io.OutputStreamWriter;
@@ -51,6 +52,7 @@ import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.BlockOpResponseP
 import org.apache.hadoop.hdfs.protocol.proto.DataTransferProtos.Status;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.ReplicaInputStreams;
 import org.apache.hadoop.hdfs.server.datanode.fsdataset.ReplicaOutputStreams;
+import org.apache.hadoop.hdfs.server.datanode.fsdataset.impl.FsVolumeImpl;
 import org.apache.hadoop.hdfs.server.datanode.metrics.DataNodePeerMetrics;
 import org.apache.hadoop.hdfs.server.protocol.DatanodeRegistration;
 import org.apache.hadoop.hdfs.util.DataTransferThrottler;
@@ -149,6 +151,19 @@ class BlockReceiver implements Closeable {
   private final AtomicLong lastSentTime = new AtomicLong(0L);
   private long maxSendIdleTime;
 
+  /** True iff packets should be accumulated in {@link #buffer} instead of
+   * being written directly to the data stream. Only enabled for newly
+   * created RBW replicas — pipeline/append recovery requires truncating
+   * the existing file and is not supported by the buffer path. Non-final
+   * so that an exception thrown earlier in the constructor leaves the
+   * field at a safe default before {@link #close()} runs via
+   * {@code IOUtils.closeStream(this)}. */
+  private boolean useWriteBuffer = false;
+  /** Always non-null. {@link BufferedBlockWriter#NO_OP_INSTANCE} when the
+   * feature is disabled — keeps the hot path branch-free. Initialized to
+   * the no-op so partially-constructed receivers are still safe to close. */
+  private BufferedBlockWriter buffer = BufferedBlockWriter.NO_OP_INSTANCE;
+
   BlockReceiver(final ExtendedBlock block, final StorageType storageType,
       final DataInputStream in,
       final String inAddr, final String myAddr,
@@ -209,6 +224,7 @@ class BlockReceiver implements Closeable {
         );
       }
 
+      boolean isNewRbw = false;
       //
       // Open local disk out
       //
@@ -225,6 +241,7 @@ class BlockReceiver implements Closeable {
           }
           datanode.notifyNamenodeReceivingBlock(
               block, replicaHandler.getReplica().getStorageUuid());
+          isNewRbw = true;
           break;
         case PIPELINE_SETUP_STREAMING_RECOVERY:
           replicaHandler = datanode.data.recoverRbw(
@@ -276,10 +293,31 @@ class BlockReceiver implements Closeable {
       this.checksumOut = new DataOutputStream(new BufferedOutputStream(
           streams.getChecksumOut(), DFSUtilClient.getSmallBufferSize(
           datanode.getConf())));
+      // Only enable the buffered writer for a brand-new RBW. Recovery /
+      // append paths need to truncate the existing file and resume from a
+      // specific position, which the buffered writer does not implement.
+      FsVolumeImpl fsVolume = (replicaInfo.getReplicaInfo() != null
+          && replicaInfo.getReplicaInfo().getVolume() instanceof FsVolumeImpl)
+              ? (FsVolumeImpl) replicaInfo.getReplicaInfo().getVolume()
+              : null;
+      File blockFile = (replicaInfo instanceof LocalReplica)
+          ? ((LocalReplica) replicaInfo).getBlockFile() : null;
+      boolean enableBuffer = datanode.isWriteMemoryBufferEnabled()
+          && isNewRbw
+          && fsVolume != null
+          && fsVolume.getBufferResources() != null
+          && blockFile != null;
+      BufferedBlockWriter newBuffer = createWriteBuffer(enableBuffer,
+          blockFile, fsVolume, datanode);
+      // If construction silently fell back to NO_OP, treat the receiver as if
+      // buffering were disabled so the fast path stays consistent.
+      this.useWriteBuffer = enableBuffer
+          && newBuffer != BufferedBlockWriter.NO_OP_INSTANCE;
+      this.buffer = newBuffer;
       // write data chunk header if creating a new replica
       if (isCreate) {
         BlockMetadataHeader.writeHeader(checksumOut, diskChecksum);
-      } 
+      }
     } catch (ReplicaAlreadyExistsException | ReplicaNotFoundException
         | DiskOutOfSpaceException e) {
       throw e;
@@ -304,8 +342,39 @@ class BlockReceiver implements Closeable {
     }
   }
 
+  /**
+   * Choose between the DSYNC FileChannel-backed and the O_DIRECT-backed
+   * buffered writer based on configuration. Any failure to construct one
+   * gracefully degrades to {@link BufferedBlockWriter#NO_OP_INSTANCE} so the
+   * block can still be received via the legacy path.
+   */
+  private BufferedBlockWriter createWriteBuffer(boolean useBuffer,
+      File blockFile, FsVolumeImpl volume, DataNode dn) {
+    if (!useBuffer || blockFile == null || volume == null) {
+      return BufferedBlockWriter.NO_OP_INSTANCE;
+    }
+    try {
+      if (dn.getDnConf().useOdirectBuffer) {
+        return new DirectIOBufferedBlockWriter(this, blockFile, volume,
+            dn.getMaxConcurrentWriteBuffers());
+      }
+      return new BufferedBlockWriterImpl(this, blockFile, volume,
+          dn.getMaxConcurrentWriteBuffers());
+    } catch (Throwable t) {
+      LOG.error("Failed to create write buffer for {}; falling back to "
+          + "direct disk writes: {}", block.getBlockName(), t.toString(), t);
+      return BufferedBlockWriter.NO_OP_INSTANCE;
+    }
+  }
+
   /** Return the datanode object. */
   DataNode getDataNode() {return datanode;}
+
+  /** Block identifier accessed by {@link BufferedBlockWriter} implementations
+   * for log messages. */
+  public ExtendedBlock getBlock() {
+    return block;
+  }
 
   Replica getReplica() {
     return replicaInfo;
@@ -362,6 +431,18 @@ class BlockReceiver implements Closeable {
     finally {
       IOUtils.closeStream(checksumOut);
     }
+    // Drain the in-memory buffer before closing the underlying streams so
+    // its contents land on disk and any pending fsync is observed.
+    if (useWriteBuffer) {
+      try {
+        buffer.flushOrSync(syncOnClose, true /* bufferFlush */,
+            true /* isClosed */);
+      } catch (IOException e) {
+        if (ioe == null) {
+          ioe = e;
+        }
+      }
+    }
     // close block file
     try {
       if (streams.getDataOut() != null) {
@@ -370,7 +451,11 @@ class BlockReceiver implements Closeable {
         long flushEndNanos = System.nanoTime();
         if (syncOnClose) {
           long fsyncStartNanos = flushEndNanos;
-          streams.syncDataOut();
+          if (useWriteBuffer) {
+            buffer.syncData(block.getBlockName(), true);
+          } else {
+            streams.syncDataOut();
+          }
           datanode.metrics.addFsyncNanos(System.nanoTime() - fsyncStartNanos);
         }
         flushTotalNanos += flushEndNanos - flushStartNanos;
@@ -382,6 +467,7 @@ class BlockReceiver implements Closeable {
     }
     finally{
       streams.close();
+      buffer.release();
     }
     if (replicaHandler != null) {
       IOUtils.cleanupWithLogger(null, replicaHandler);
@@ -425,6 +511,31 @@ class BlockReceiver implements Closeable {
    * @throws IOException
    */
   void flushOrSync(boolean isSync, long seqno) throws IOException {
+    flushOrSync(isSync, false /* bufferFlush */, seqno);
+  }
+
+  /**
+   * Variant that lets callers force a write-buffer drain even if {@code
+   * isSync} is false. Used by the buffered writer when it fills up.
+   */
+  void flushOrSync(boolean isSync, boolean bufferFlush, long seqno)
+      throws IOException {
+    flushOrSync(isSync, isSync /* isChecksumSync */, bufferFlush,
+        false /* isClosed */, seqno);
+  }
+
+  /**
+   * Variant invoked by {@link BufferedBlockWriter} implementations. Splits
+   * {@code isChecksumSync} from {@code isSync} so that the buffered path can
+   * fsync data without also fsync'ing the checksum stream on every flush.
+   */
+  public void flushOrSync(boolean isSync, boolean isChecksumSync,
+      boolean bufferFlush, boolean isClosed) throws IOException {
+    flushOrSync(isSync, isChecksumSync, bufferFlush, isClosed, -1L);
+  }
+
+  private void flushOrSync(boolean isSync, boolean isChecksumSync,
+      boolean bufferFlush, boolean isClosed, long seqno) throws IOException {
     long flushTotalNanos = 0;
     long begin = Time.monotonicNow();
     DataNodeFaultInjector.get().delay();
@@ -432,11 +543,22 @@ class BlockReceiver implements Closeable {
       long flushStartNanos = System.nanoTime();
       checksumOut.flush();
       long flushEndNanos = System.nanoTime();
-      if (isSync) {
+      if (isChecksumSync) {
         streams.syncChecksumOut();
         datanode.metrics.addFsyncNanos(System.nanoTime() - flushEndNanos);
       }
       flushTotalNanos += flushEndNanos - flushStartNanos;
+    }
+    // When buffering is on, packets accumulate in the in-memory buffer until
+    // an explicit flush or sync is requested. Without one of those flags
+    // there is nothing to drain — return early to keep the hot path cheap.
+    if (useWriteBuffer && !isSync && !bufferFlush) {
+      return;
+    }
+    if (useWriteBuffer) {
+      // Drain the buffer to disk before fsync. Wrapped in flush() to honor
+      // the per-volume flush concurrency permit.
+      buffer.flush();
     }
     if (streams.getDataOut() != null) {
       long flushStartNanos = System.nanoTime();
@@ -444,7 +566,11 @@ class BlockReceiver implements Closeable {
       long flushEndNanos = System.nanoTime();
       if (isSync) {
         long fsyncStartNanos = flushEndNanos;
-        streams.syncDataOut();
+        if (useWriteBuffer) {
+          buffer.syncData(block.getBlockName(), isClosed);
+        } else {
+          streams.syncDataOut();
+        }
         datanode.metrics.addFsyncNanos(System.nanoTime() - fsyncStartNanos);
       }
       flushTotalNanos += flushEndNanos - flushStartNanos;
@@ -755,10 +881,16 @@ class BlockReceiver implements Closeable {
           // Actual number of data bytes to write.
           int numBytesToDisk = (int)(offsetInBlock-onDiskLen);
           
-          // Write data to disk.
+          // Write data to disk — through the in-memory buffer when enabled
+          // so that many small packet writes coalesce into a single large
+          // disk write per buffer fill.
           long begin = Time.monotonicNow();
-          streams.writeDataToDisk(dataBuf.array(),
-              startByteToDisk, numBytesToDisk);
+          if (useWriteBuffer) {
+            buffer.writeData(dataBuf, startByteToDisk, numBytesToDisk);
+          } else {
+            streams.writeDataToDisk(dataBuf.array(),
+                startByteToDisk, numBytesToDisk);
+          }
           // no-op in prod
           DataNodeFaultInjector.get().delayWriteToDisk();
           long duration = Time.monotonicNow() - begin;
@@ -1054,6 +1186,20 @@ class BlockReceiver implements Closeable {
     } finally {
       // Clear the previous interrupt state of this thread.
       Thread.interrupted();
+      if (useWriteBuffer) {
+        // If we got here via upstream failure / interrupt, the most recent
+        // packets may still be sitting in the in-memory buffer. Best-effort
+        // flush so a recovery client sees a sensible bytesOnDisk.
+        flushBufferSafelyIfEnabled();
+        if (LOG.isInfoEnabled()) {
+          LOG.info(
+              "[{}] During closing buffer, on-disk-bytes={}, "
+                  + "buffer-flushed-bytes={}, interrupted={}",
+              block.getBlockName(), replicaInfo.getBytesOnDisk(),
+              buffer.getFlushedBytes(),
+              Thread.currentThread().isInterrupted());
+        }
+      }
 
       // If a shutdown for restart was initiated, upstream needs to be notified.
       // There is no need to do anything special if the responder was closed
@@ -1084,14 +1230,14 @@ class BlockReceiver implements Closeable {
               // It is already going down. Ignore this.
             }
           }
-          responder.interrupt();
+          interrupt(responder);
         }
         IOUtils.closeStream(this);
         cleanupBlock();
       }
       if (responder != null) {
         try {
-          responder.interrupt();
+          interrupt(responder);
           // join() on the responder should timeout a bit earlier than the
           // configured deadline. Otherwise, the join() on this thread will
           // likely timeout as well.
@@ -1105,7 +1251,7 @@ class BlockReceiver implements Closeable {
             throw new IOException(msg);
           }
         } catch (InterruptedException e) {
-          responder.interrupt();
+          interrupt(responder);
           // do not throw if shutting down for restart.
           if (!datanode.isRestarting()) {
             throw new InterruptedIOException("Interrupted receiveBlock");
@@ -1113,6 +1259,33 @@ class BlockReceiver implements Closeable {
         }
         responder = null;
       }
+    }
+  }
+
+  /**
+   * Drain the in-memory write buffer (if any) before interrupting a thread
+   * so that an in-flight {@link java.nio.channels.FileChannel#write} doesn't
+   * get cancelled mid-buffer leaving torn data on disk.
+   */
+  private void interrupt(Thread thread) {
+    flushBufferSafelyIfEnabled();
+    thread.interrupt();
+  }
+
+  private void flushBufferSafelyIfEnabled() {
+    if (!useWriteBuffer) {
+      return;
+    }
+    try {
+      buffer.flush();
+    } catch (IOException e) {
+      LOG.warn("Failed to flush write buffer for {}", block.getBlockName(), e);
+    } catch (Throwable t) {
+      // Defensive: never let the flush bubble up — the caller is on a
+      // cleanup / interrupt path and we don't want to mask the original
+      // failure.
+      LOG.warn("Unexpected throwable flushing write buffer for {}",
+          block.getBlockName(), t);
     }
   }
 
@@ -1382,7 +1555,7 @@ class BlockReceiver implements Closeable {
             ackQueue.wait();
           } catch (InterruptedException e) {
             running = false;
-            Thread.currentThread().interrupt();
+            interrupt(Thread.currentThread());
           }
         }
         LOG.debug("{}: closing", this);
@@ -1533,14 +1706,14 @@ class BlockReceiver implements Closeable {
             LOG.info(myString, e);
             running = false;
             if (!Thread.interrupted()) { // failure not caused by interruption
-              receiverThread.interrupt();
+              interrupt(receiverThread);
             }
           }
         } catch (Throwable e) {
           if (running) {
             LOG.info(myString, e);
             running = false;
-            receiverThread.interrupt();
+            interrupt(receiverThread);
           }
         }
       }

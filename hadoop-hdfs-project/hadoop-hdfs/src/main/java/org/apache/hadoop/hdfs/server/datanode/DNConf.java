@@ -98,6 +98,8 @@ public class DNConf {
   final boolean syncBehindWrites;
   final boolean syncBehindWritesInBackground;
   final boolean dropCacheBehindReads;
+  final long readAheadCacheBytesThreshold;
+  final boolean useOdirectBuffer;
   final boolean syncOnClose;
   final boolean encryptDataTransfer;
   final boolean connectToDnViaHostname;
@@ -186,6 +188,12 @@ public class DNConf {
     dropCacheBehindReads = getConf().getBoolean(
         DFSConfigKeys.DFS_DATANODE_DROP_CACHE_BEHIND_READS_KEY,
         DFSConfigKeys.DFS_DATANODE_DROP_CACHE_BEHIND_READS_DEFAULT);
+    readAheadCacheBytesThreshold = getConf().getLong(
+        DFSConfigKeys.DFS_DATANODE_READ_AHEAD_CACHE_BYTES_THRESHOLD_KEY,
+        DFSConfigKeys.DFS_DATANODE_READ_AHEAD_CACHE_BYTES_THRESHOLD_DEFAULT);
+    useOdirectBuffer = getConf().getBoolean(
+        DFSConfigKeys.DFS_DATANODE_WRITE_O_DIRECT_ENABLED,
+        DFSConfigKeys.DFS_DATANODE_WRITE_O_DIRECT_ENABLED_DEFAULT);
     connectToDnViaHostname = getConf().getBoolean(
         DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME,
         DFSConfigKeys.DFS_DATANODE_USE_DN_HOSTNAME_DEFAULT);

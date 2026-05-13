@@ -156,7 +156,17 @@ public class ReplicaOutputStreams implements Closeable {
 
   public void dropCacheBehindWrites(String identifier,
       long offset, long len, int flags) throws NativeIOException {
+    dropCacheBehindWrites(identifier, outFd, offset, len, flags);
+  }
+
+  /**
+   * Drop the page cache for a specific file descriptor — used by the
+   * {@link org.apache.hadoop.hdfs.server.datanode.BufferedBlockWriter} path
+   * where the buffered writer holds its own fd separate from {@link #outFd}.
+   */
+  public void dropCacheBehindWrites(String identifier, FileDescriptor fd,
+      long offset, long len, int flags) throws NativeIOException {
     fileIoProvider.posixFadvise(
-        volume, identifier, outFd, offset, len, flags);
+        volume, identifier, fd, offset, len, flags);
   }
 }

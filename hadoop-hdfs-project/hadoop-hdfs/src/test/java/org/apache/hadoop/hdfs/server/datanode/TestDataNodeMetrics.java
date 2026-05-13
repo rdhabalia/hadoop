@@ -36,11 +36,14 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
+import java.security.SecureRandom;
+import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.List;
 import java.util.function.Supplier;
+import org.apache.hadoop.fs.permission.FsPermission;
 
 import net.jcip.annotations.NotThreadSafe;
 
@@ -837,6 +840,66 @@ public class TestDataNodeMetrics {
       MetricsRecordBuilder rb = getMetrics(datanode.getMetrics().name());
       assertCounterGt("AcquireDatasetWriteLockNumOps", (long)1, rb);
       assertCounterGt("AcquireDatasetReadLockNumOps", (long)1, rb);
+    }
+  }
+
+  /**
+   * End-to-end smoke test for the BufferedBlockWriter path. Writes a few
+   * 128MB blocks with {@code dfs.datanode.write.memory.buffer.enabled=true}
+   * and reads them back; verifies the data round-trips. The O_DIRECT path
+   * is skipped on non-Linux environments since it relies on JNA + Linux
+   * open flags. The DSYNC path is exercised on all platforms.
+   */
+  @Test
+  public void testWriteBufferDataNodeWrites() throws Exception {
+    runPooledBufferRoundTrip(false);
+    String os = System.getProperty("os.name", "").toLowerCase();
+    if (os.contains("linux")) {
+      runPooledBufferRoundTrip(true);
+    }
+  }
+
+  private void runPooledBufferRoundTrip(boolean useODirectBuffer)
+      throws Exception {
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        true);
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_O_DIRECT_ENABLED,
+        useODirectBuffer);
+    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+    try {
+      final FileSystem fs = cluster.getFileSystem();
+      List<DataNode> datanodes = cluster.getDataNodes();
+      assertEquals(1, datanodes.size());
+      final AtomicInteger x = new AtomicInteger(0);
+      // Keep the size modest under test (4MB) — the original 128MB used in
+      // the design doc was for production benchmarking, not unit tests.
+      int size = 4 * 1024 * 1024;
+      byte[] inputData = new byte[size];
+      int totalFiles = 3;
+      for (int i = 0; i < totalFiles; i++) {
+        new SecureRandom().nextBytes(inputData);
+        Path fileName = new Path("/buffered-write." + x.getAndIncrement());
+        try (FSDataOutputStream out = fs.create(fileName,
+            FsPermission.getDefault(),
+            true /* overwrite */,
+            4096 /* bufferSize */,
+            (short) 1 /* replication */,
+            inputData.length /* blockSize */,
+            null)) {
+          out.write(inputData);
+        }
+        byte[] outputData = new byte[size];
+        try (FSDataInputStream in = fs.open(fileName)) {
+          in.readFully(0, outputData);
+        }
+        assertTrue(Arrays.equals(inputData, outputData),
+            "Data mismatch on round-trip for " + fileName);
+      }
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
     }
   }
 }
