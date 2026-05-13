@@ -1625,11 +1625,6 @@ public class DFSConfigKeys extends CommonConfigurationKeys {
       "dfs.datanode.write.memory.buffer.max.capacity.mb";
   public static final int DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB_DEFAULT =
       -1;
-  // Toggle the O_DIRECT-based buffered writer (experimental).
-  public static final String DFS_DATANODE_WRITE_O_DIRECT_ENABLED =
-      "dfs.datanode.write.o.direct.enabled";
-  public static final boolean DFS_DATANODE_WRITE_O_DIRECT_ENABLED_DEFAULT =
-      false;
   // Per-volume flush concurrency budget (MB).
   // 0 disables the per-volume flush semaphore.
   public static final String DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME =

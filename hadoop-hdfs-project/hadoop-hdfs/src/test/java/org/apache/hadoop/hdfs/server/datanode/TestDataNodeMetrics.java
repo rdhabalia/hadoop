@@ -845,27 +845,18 @@ public class TestDataNodeMetrics {
 
   /**
    * End-to-end smoke test for the BufferedBlockWriter path. Writes a few
-   * 128MB blocks with {@code dfs.datanode.write.memory.buffer.enabled=true}
-   * and reads them back; verifies the data round-trips. The O_DIRECT path
-   * is skipped on non-Linux environments since it relies on JNA + Linux
-   * open flags. The DSYNC path is exercised on all platforms.
+   * blocks with {@code dfs.datanode.write.memory.buffer.enabled=true} and
+   * reads them back; verifies the data round-trips.
    */
   @Test
   public void testWriteBufferDataNodeWrites() throws Exception {
-    runPooledBufferRoundTrip(false);
-    String os = System.getProperty("os.name", "").toLowerCase();
-    if (os.contains("linux")) {
-      runPooledBufferRoundTrip(true);
-    }
+    runPooledBufferRoundTrip();
   }
 
-  private void runPooledBufferRoundTrip(boolean useODirectBuffer)
-      throws Exception {
+  private void runPooledBufferRoundTrip() throws Exception {
     Configuration conf = new HdfsConfiguration();
     conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
         true);
-    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_O_DIRECT_ENABLED,
-        useODirectBuffer);
     MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
     try {
       final FileSystem fs = cluster.getFileSystem();
@@ -896,6 +887,180 @@ public class TestDataNodeMetrics {
         assertTrue(Arrays.equals(inputData, outputData),
             "Data mismatch on round-trip for " + fileName);
       }
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  /**
+   * Append must take the legacy direct-write path: the buffered writer
+   * requires truncating the existing file at recovery time, which it does
+   * not implement. This test exercises the append code path with the
+   * buffer feature enabled and verifies the resulting file matches the
+   * concatenated input.
+   */
+  @Test
+  public void testWriteBufferAppendBypassesBuffer() throws Exception {
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        true);
+    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+    try {
+      FileSystem fs = cluster.getFileSystem();
+      Path p = new Path("/append-bypass.bin");
+      byte[] part1 = new byte[1024 * 1024];
+      byte[] part2 = new byte[512 * 1024];
+      new SecureRandom().nextBytes(part1);
+      new SecureRandom().nextBytes(part2);
+
+      try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+          1024 * 1024 * 8 /* blockSize */)) {
+        out.write(part1);
+      }
+      try (FSDataOutputStream out = fs.append(p)) {
+        out.write(part2);
+      }
+
+      byte[] expected = new byte[part1.length + part2.length];
+      System.arraycopy(part1, 0, expected, 0, part1.length);
+      System.arraycopy(part2, 0, expected, part1.length, part2.length);
+      byte[] actual = new byte[expected.length];
+      try (FSDataInputStream in = fs.open(p)) {
+        in.readFully(0, actual);
+      }
+      assertTrue(Arrays.equals(expected, actual),
+          "append must round-trip even when the buffer feature is on");
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  /**
+   * hsync must drain the in-memory buffer and fsync the file. After hsync,
+   * the visible file length must reflect the bytes written so far, and
+   * after close the file must round-trip exactly.
+   */
+  @Test
+  public void testWriteBufferHsyncFlushesToDisk() throws Exception {
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        true);
+    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+    try {
+      DistributedFileSystem fs = (DistributedFileSystem) cluster.getFileSystem();
+      Path p = new Path("/hsync-buffered.bin");
+      byte[] data = new byte[256 * 1024];
+      new SecureRandom().nextBytes(data);
+
+      try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+          1024 * 1024 * 8 /* blockSize */)) {
+        out.write(data);
+        out.hsync();
+        // Visible length should reflect the hsync'd byte count even though
+        // the file is still open. With the buffer enabled this only works
+        // if hsync drained the in-memory buffer through to disk.
+        long visible = fs.getFileStatus(p).getLen();
+        assertEquals(data.length, visible,
+            "hsync should make the buffered bytes visible to readers");
+      }
+      // After close the data must round-trip exactly.
+      byte[] readBack = new byte[data.length];
+      try (FSDataInputStream in = fs.open(p)) {
+        in.readFully(0, readBack);
+      }
+      assertTrue(Arrays.equals(data, readBack),
+          "round-trip after close must match the written data");
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  /**
+   * Multiple concurrent writers must share the global write-buffer permit
+   * and not corrupt each other's blocks. This exercises the global
+   * Semaphore in DataNode and the per-volume flush concurrency knob.
+   */
+  @Test
+  public void testWriteBufferConcurrentWriters() throws Exception {
+    Configuration conf = new HdfsConfiguration();
+    conf.setBoolean(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_ENABLED,
+        true);
+    // Force the concurrency cap to be very low so most writers block on
+    // the global semaphore — exercises the queueing path.
+    conf.setInt(DFSConfigKeys.DFS_DATANODE_WRITE_MEMORY_BUFFER_MAX_CAPACITY_MB,
+        16);
+    conf.setInt(DFSConfigKeys.DFS_DATANODE_CONCURRENT_FLUSH_MB_PER_VOLUME,
+        16);
+    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+    try {
+      final FileSystem fs = cluster.getFileSystem();
+      final int numWriters = 6;
+      final int payloadSize = 256 * 1024;
+      final byte[][] payloads = new byte[numWriters][];
+      for (int i = 0; i < numWriters; i++) {
+        payloads[i] = new byte[payloadSize];
+        new SecureRandom().nextBytes(payloads[i]);
+      }
+      java.util.concurrent.ExecutorService pool =
+          java.util.concurrent.Executors.newFixedThreadPool(numWriters);
+      java.util.List<java.util.concurrent.Future<?>> futures =
+          new java.util.ArrayList<>();
+      for (int i = 0; i < numWriters; i++) {
+        final int idx = i;
+        futures.add(pool.submit(() -> {
+          Path p = new Path("/concurrent-" + idx + ".bin");
+          try (FSDataOutputStream out = fs.create(p, true, 4096, (short) 1,
+              1024 * 1024 * 8)) {
+            out.write(payloads[idx]);
+          }
+          return null;
+        }));
+      }
+      for (java.util.concurrent.Future<?> f : futures) {
+        f.get(60, TimeUnit.SECONDS);
+      }
+      pool.shutdown();
+
+      // Verify every file round-trips.
+      for (int i = 0; i < numWriters; i++) {
+        Path p = new Path("/concurrent-" + i + ".bin");
+        byte[] readBack = new byte[payloadSize];
+        try (FSDataInputStream in = fs.open(p)) {
+          in.readFully(0, readBack);
+        }
+        assertTrue(Arrays.equals(payloads[i], readBack),
+            "Mismatch for concurrent writer " + i);
+      }
+    } finally {
+      if (cluster != null) {
+        cluster.shutdown();
+      }
+    }
+  }
+
+  /**
+   * Verify the new dfs.datanode.read.ahead.cache.bytes.threshold config
+   * propagates into the DataNode's DNConf — BlockSender#isLongRead reads
+   * it from there.
+   */
+  @Test
+  public void testReadAheadCacheBytesThresholdIsConfigurable()
+      throws Exception {
+    Configuration conf = new HdfsConfiguration();
+    long custom = 1024L * 1024L;
+    conf.setLong(DFSConfigKeys.DFS_DATANODE_READ_AHEAD_CACHE_BYTES_THRESHOLD_KEY,
+        custom);
+    MiniDFSCluster cluster = new MiniDFSCluster.Builder(conf).build();
+    try {
+      DataNode dn = cluster.getDataNodes().get(0);
+      assertEquals(custom, dn.getDnConf().readAheadCacheBytesThreshold,
+          "DNConf should expose the configured read-ahead threshold");
     } finally {
       if (cluster != null) {
         cluster.shutdown();

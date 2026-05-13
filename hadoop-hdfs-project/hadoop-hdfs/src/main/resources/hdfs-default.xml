@@ -1819,15 +1819,6 @@
 </property>
 
 <property>
-  <name>dfs.datanode.write.o.direct.enabled</name>
-  <value>false</value>
-  <description>
-    Experimental: use O_DIRECT for the buffered write path instead of a
-    DSYNC FileChannel. Requires JNA and Linux. Defaults to false.
-  </description>
-</property>
-
-<property>
   <name>dfs.datanode.concurrent.flush.mb.per.volume</name>
   <value>0</value>
   <description>

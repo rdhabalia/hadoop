@@ -343,10 +343,9 @@ class BlockReceiver implements Closeable {
   }
 
   /**
-   * Choose between the DSYNC FileChannel-backed and the O_DIRECT-backed
-   * buffered writer based on configuration. Any failure to construct one
-   * gracefully degrades to {@link BufferedBlockWriter#NO_OP_INSTANCE} so the
-   * block can still be received via the legacy path.
+   * Construct the DSYNC FileChannel-backed buffered writer. Any failure
+   * gracefully degrades to {@link BufferedBlockWriter#NO_OP_INSTANCE} so
+   * the block can still be received via the legacy direct-write path.
    */
   private BufferedBlockWriter createWriteBuffer(boolean useBuffer,
       File blockFile, FsVolumeImpl volume, DataNode dn) {
@@ -354,10 +353,6 @@ class BlockReceiver implements Closeable {
       return BufferedBlockWriter.NO_OP_INSTANCE;
     }
     try {
-      if (dn.getDnConf().useOdirectBuffer) {
-        return new DirectIOBufferedBlockWriter(this, blockFile, volume,
-            dn.getMaxConcurrentWriteBuffers());
-      }
       return new BufferedBlockWriterImpl(this, blockFile, volume,
           dn.getMaxConcurrentWriteBuffers());
     } catch (Throwable t) {

@@ -22,9 +22,11 @@ import static org.apache.hadoop.io.nativeio.NativeIO.POSIX.POSIX_FADV_DONTNEED;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.nio.channels.ClosedByInterruptException;
+import java.nio.channels.ClosedChannelException;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
 import java.util.concurrent.ExecutorService;
@@ -202,8 +204,12 @@ public class BufferedBlockWriterImpl implements BufferedBlockWriter {
    * middle of an NIO write.
    */
   synchronized void flushInternal() throws IOException {
-    if (nettyBuf == null || nettyBuf.readableBytes() == 0) {
+    if (closed.get() || nettyBuf == null || nettyBuf.readableBytes() == 0) {
       return;
+    }
+    FileChannel localFc = fc;
+    if (localFc == null || !localFc.isOpen()) {
+      throw new ClosedChannelException();
     }
     nettyBuf.markReaderIndex();
     boolean success = false;
@@ -314,7 +320,13 @@ public class BufferedBlockWriterImpl implements BufferedBlockWriter {
     }
   }
 
-  private void acquirePermit() {
+  /**
+   * Block until a global write-buffer permit is acquired. If interrupted,
+   * the interrupt flag is restored and an {@link InterruptedIOException} is
+   * thrown so the constructor cannot silently allocate a buffer without
+   * holding the bound.
+   */
+  private void acquirePermit() throws InterruptedIOException {
     if (writeMemoryBufferMaxConcurrentWrites.availablePermits() <= 0
         && LOG.isInfoEnabled()) {
       LOG.info(
@@ -326,8 +338,9 @@ public class BufferedBlockWriterImpl implements BufferedBlockWriter {
       permitAcquired = true;
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      LOG.info("Interrupted while acquiring write-buffer permit for {}",
-          blockName);
+      throw (InterruptedIOException) new InterruptedIOException(
+          "Interrupted while acquiring write-buffer permit for "
+              + blockName).initCause(e);
     }
   }
 

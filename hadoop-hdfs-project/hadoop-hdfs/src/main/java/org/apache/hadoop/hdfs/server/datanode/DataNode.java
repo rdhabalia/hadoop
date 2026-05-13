@@ -4442,9 +4442,8 @@ public class DataNode extends ReconfigurableBase
     this.maxConcurrentWriteBuffers = new Semaphore(maxConcurrentWrites);
     LOG.info(
         "Configured pooled write buffer: max-concurrent-buffers={}, "
-            + "max-capacity-mb={}, useODirect={}",
-        maxConcurrentWrites, writeMemoryBufferMaxCapacityMB,
-        dnConf.useOdirectBuffer);
+            + "max-capacity-mb={}",
+        maxConcurrentWrites, writeMemoryBufferMaxCapacityMB);
   }
 
   /** @return whether the DataNode-wide write-memory-buffer is enabled. */
